@@ -1,0 +1,272 @@
+#!/bin/bash
+
+# Script Name: sqlite3_backup
+# Description: Backs up SQLite databases from a source to a destination with options for verbosity and backup retention.
+
+# Path to sqlite3_rsync utility
+SQLITE3_RSYNC="/usr/local/bin/sqlite3_rsync"
+
+# Path to sqlite3 for verification
+SQLITE3="/usr/bin/sqlite3"
+
+# Function to display usage information
+usage() {
+    cat <<EOF
+Usage: sqlite3_backup <source> <dest> [options]
+
+Options:
+  -V, --verbose        Enable verbose output
+  -h, --help           Display this help message
+  -a, --age <days>     Maximum age of backups to keep, in days
+
+Description:
+  This script backs up SQLite databases from the <source> to the <dest> directory.
+  The source can be a single database, a glob pattern (e.g., path/*.sqlite3), or a directory.
+  The destination must be an existing directory.
+EOF
+}
+
+# Function to log verbose messages
+log_verbose() {
+    if [ "$VERBOSE" -eq 1 ]; then
+        echo "$1"
+        if [ -n "$2" ]; then
+            echo "    command: $2"
+        fi
+    fi
+}
+
+# Function to output JSON
+output_json() {
+    local json="{"
+    local first=true
+    for db in "${!VERIFY_RESULTS[@]}"; do
+        if [ "$first" = true ]; then
+            first=false
+        else
+            json+=", "
+        fi
+        # Escape double quotes and backslashes in output
+        sanitized_output=$(echo "${VERIFY_RESULTS[$db]}" | sed 's/\\/\\\\/g; s/"/\\"/g')
+        json+="\"$db\": [$sanitized_output]"
+    done
+    json+="}"
+    echo "$json"
+}
+
+# Function to handle errors
+error_exit() {
+    echo "Error: $1" >&2
+    exit "${2:-1}"
+}
+
+# Initialize variables
+VERBOSE=0
+AGE=""
+declare -A VERIFY_RESULTS
+
+# Parse command-line options
+TEMP=$(getopt -o Vha: --long verbose,help,age: -n 'sqlite3_backup' -- "$@")
+if [ $? != 0 ]; then
+    usage
+    exit 1
+fi
+
+eval set -- "$TEMP"
+
+while true; do
+    case "$1" in
+        -V|--verbose )
+            VERBOSE=1
+            shift
+            ;;
+        -h|--help )
+            usage
+            exit 0
+            ;;
+        -a|--age )
+            AGE="$2"
+            if ! [[ "$AGE" =~ ^[0-9]+$ ]]; then
+                error_exit "Invalid age value: $2. It must be a positive integer."
+            fi
+            shift 2
+            ;;
+        -- )
+            shift
+            break
+            ;;
+        * )
+            break
+            ;;
+    esac
+done
+
+# Check for required positional arguments
+if [ $# -ne 2 ]; then
+    error_exit "Source and destination directories are required." 1
+fi
+
+SOURCE_INPUT="$1"
+DEST="$2"
+
+# Check if destination directory exists and is a directory
+if [ ! -d "$DEST" ]; then
+    error_exit "Destination directory '$DEST' does not exist or is not a directory." 1
+fi
+
+# Determine the list of source databases
+declare -a SOURCE_DB_PATHS=()
+
+if [ -d "$SOURCE_INPUT" ]; then
+    # Source is a directory, include all *.sqlite3 files
+    SOURCE_DB_PATHS=("$SOURCE_INPUT"/*.sqlite3)
+    # Check if glob didn't match any files
+    if [ ! -e "${SOURCE_DB_PATHS[0]}" ]; then
+        error_exit "No .sqlite3 files found in directory '$SOURCE_INPUT'." 1
+    fi
+elif [[ "$SOURCE_INPUT" == *\* ]]; then
+    # Source is a glob pattern
+    SOURCE_DB_PATHS=($SOURCE_INPUT)
+    # Check if glob didn't match any files
+    if [ ! -e "${SOURCE_DB_PATHS[0]}" ]; then
+        error_exit "Glob pattern '$SOURCE_INPUT' did not match any files." 1
+    fi
+elif [ -f "$SOURCE_INPUT" ]; then
+    # Source is a single file
+    SOURCE_DB_PATHS=("$SOURCE_INPUT")
+else
+    error_exit "Source '$SOURCE_INPUT' is not a valid directory, glob pattern, or file." 1
+fi
+
+# Validate that all source paths are files
+for db_path in "${SOURCE_DB_PATHS[@]}"; do
+    if [ ! -f "$db_path" ]; then
+        error_exit "Source path '$db_path' is not a file." 1
+    fi
+done
+
+# Get current date components
+CURRENT_YEAR_MONTH=$(date +"%Y-%m")
+CURRENT_DAY=$(date +"%d")
+# Replace colons with hyphens in the timestamp
+CURRENT_TIMESTAMP=$(date +"%Y-%m-%d-%H-%M-%S")
+
+# Define directories
+MONTHDIR="$DEST/$CURRENT_YEAR_MONTH"
+DAYDIR="$MONTHDIR/$CURRENT_DAY"
+WORKDIR="$DAYDIR/_working"
+
+# Step 1: Create monthdir
+log_verbose "Creating month directory '$MONTHDIR':" "mkdir -p \"$MONTHDIR\""
+mkdir -p "$MONTHDIR" || error_exit "Failed to create month directory '$MONTHDIR'."
+
+# Step 2: Create daydir
+log_verbose "Creating day directory '$DAYDIR':" "mkdir -p \"$DAYDIR\""
+mkdir -p "$DAYDIR" || error_exit "Failed to create day directory '$DAYDIR'."
+
+# Step 3: Create workdir
+log_verbose "Creating working directory '$WORKDIR':" "mkdir -p \"$WORKDIR\""
+mkdir -p "$WORKDIR" || error_exit "Failed to create working directory '$WORKDIR'."
+
+# Step 4: Backup each database using sqlite3_rsync
+for db_path in "${SOURCE_DB_PATHS[@]}"; do
+    dbname=$(basename "$db_path")
+    replica_path="$WORKDIR/$dbname"
+
+    log_verbose "Backing up '$dbname' to '$replica_path':" "\"$SQLITE3_RSYNC\" \"$db_path\" \"$replica_path\""
+    "$SQLITE3_RSYNC" "$db_path" "$replica_path"
+    RSYNC_EXIT_CODE=$?
+
+    if [ "$RSYNC_EXIT_CODE" -ne 0 ]; then
+        error_exit "sqlite3_rsync failed for database '$dbname' with exit code $RSYNC_EXIT_CODE." 1
+    fi
+done
+
+# Step 5: Verify copied databases
+VERIFICATION_FAILED=0
+declare -a DATABASES=("$WORKDIR"/*.sqlite3)
+
+# Check if any databases were copied
+if [ ! -e "${DATABASES[0]}" ]; then
+    error_exit "No .sqlite3 files found in working directory '$WORKDIR' after backup." 1
+fi
+
+log_verbose "Verifying copied databases:" ""
+
+for db_path in "${DATABASES[@]}"; do
+    dbname=$(basename "$db_path")
+    if [ ! -f "$db_path" ]; then
+        VERIFY_RESULTS["$dbname"]="1, \"Database file not found.\""
+        VERIFICATION_FAILED=1
+        continue
+    fi
+    log_verbose "Verifying '$dbname':" "\"$SQLITE3\" -readonly -- \"$db_path\" \"pragma integrity_check;\""
+    VERIFY_OUTPUT=$("$SQLITE3" -readonly -- "$db_path" "pragma integrity_check;" 2>&1)
+    RETURN_CODE=$?
+    # Escape double quotes and backslashes in VERIFY_OUTPUT
+    VERIFY_OUTPUT_ESCAPED=$(echo "$VERIFY_OUTPUT" | sed 's/\\/\\\\/g; s/"/\\"/g')
+    VERIFY_RESULTS["$dbname"]="$RETURN_CODE, \"$VERIFY_OUTPUT_ESCAPED\""
+    if [ "$RETURN_CODE" -ne 0 ] || [ "$VERIFY_OUTPUT" != "ok" ]; then
+        VERIFICATION_FAILED=1
+    fi
+done
+
+# Step 6 & 7: Check verification results
+if [ "$VERIFICATION_FAILED" -eq 1 ]; then
+    error_exit "One or more databases failed verification." 1
+fi
+
+# Step 9: Compress and gzip the workdir into the day directory
+BACKUP_FILENAME="backup-$CURRENT_TIMESTAMP.tar.gz"
+BACKUP_PATH="$DAYDIR/$BACKUP_FILENAME"
+log_verbose "Compressing and gzipping backup:" "tar -czf \"$BACKUP_PATH\" -C \"$WORKDIR\" ."
+tar -czf "$BACKUP_PATH" -C "$WORKDIR" . || error_exit "Failed to create backup archive."
+
+# Step 10: Remove database files from workdir to ensure it's empty
+log_verbose "Removing database files from working directory '$WORKDIR':" "rm -f \"$WORKDIR\"/*.sqlite3"
+rm -f "$WORKDIR"/*.sqlite3 || error_exit "Failed to remove database files from '$WORKDIR'."
+
+# Step 11: Delete empty workdir
+log_verbose "Deleting working directory '$WORKDIR':" "rmdir \"$WORKDIR\""
+rmdir "$WORKDIR" || error_exit "Failed to delete working directory '$WORKDIR'. It may not be empty."
+
+# Step 12: Delete old backups based on age
+if [ -n "$AGE" ]; then
+    CURRENT_DATE=$(date +%s)
+    log_verbose "Checking for backups older than $AGE days to delete:" ""
+    # Iterate over month directories
+    for month_dir in "$DEST"/*/; do
+        [ -d "$month_dir" ] || continue
+        MONTH=$(basename "$month_dir")
+        # Iterate over day directories
+        for day_dir in "$month_dir"*/; do
+            [ -d "$day_dir" ] || continue
+            DAY=$(basename "$day_dir")
+            # Construct date from directory names
+            DIR_DATE_STR="$MONTH-$DAY"
+            # Attempt to parse the date
+            DIR_DATE=$(date -d "$DIR_DATE_STR" +"%Y-%m-%d" 2>/dev/null)
+            if [ $? -ne 0 ]; then
+                # Handle invalid date formats
+                continue
+            fi
+            DIR_DATE_SEC=$(date -d "$DIR_DATE" +%s)
+            AGE_THRESHOLD_SEC=$((AGE * 86400))
+            DIFF=$(( (CURRENT_DATE - DIR_DATE_SEC) / 86400 ))
+            if [ "$DIFF" -gt "$AGE" ]; then
+                log_verbose "Deleting old backup directory '$day_dir':" "rm -rf \"$day_dir\""
+                rm -rf "$day_dir" || echo "Warning: Failed to delete '$day_dir'." >&2
+            fi
+        done
+        # After deleting day directories, check if month directory is empty
+        if [ -z "$(ls -A "$month_dir")" ]; then
+            log_verbose "Deleting empty month directory '$month_dir':" "rmdir \"$month_dir\""
+            rmdir "$month_dir" || echo "Warning: Failed to delete '$month_dir'." >&2
+        fi
+    done
+fi
+
+# Step 8 & 9: Output JSON results
+output_json
+
+exit 0
