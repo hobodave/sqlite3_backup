@@ -224,7 +224,7 @@ tar -czf "$BACKUP_PATH" -C "$WORKDIR" . || error_exit "Failed to create backup a
 
 # Step 10: Remove database files from workdir to ensure it's empty
 log_verbose "Removing database files from working directory '$WORKDIR':" "rm -f \"$WORKDIR\"/*.sqlite3"
-rm -f "$WORKDIR"/*.sqlite3 || error_exit "Failed to remove database files from '$WORKDIR'."
+rm -f "$WORKDIR"/*.sqlite3* || error_exit "Failed to remove database files from '$WORKDIR'."
 
 # Step 11: Delete empty workdir
 log_verbose "Deleting working directory '$WORKDIR':" "rmdir \"$WORKDIR\""
