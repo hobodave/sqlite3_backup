@@ -67,7 +67,7 @@ customizable retention policies.
 
 1. **Clone the Repository:**
 
-    `git clone https://github.com/yourusername/sqlite3_backup.git cd sqlite3_backup`
+    `git clone https://github.com/hobodave/sqlite3_backup.git cd sqlite3_backup`
 
 2. **Make the Script Executable:**
 
